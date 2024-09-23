@@ -118,9 +118,10 @@ defmodule Hop do
       end
 
   This simple example ignores all URLs that contain `wp-uploads`. Hop provides a convenience
-  `fetch_links/2` to fetch all of the absolute URLs on a webpage. This just uses Floki under-the-hood. 
+  `fetch_links/2` to fetch all of the absolute URLs on a webpage. This just uses Floki under-the-hood.
   """
   @default_max_depth 5
+  @default_max_page_visits 50
   @default_max_content_length 1_000_000_000
   @default_accepted_schemes ["http", "https"]
   @default_accepted_mime_types [
@@ -135,6 +136,7 @@ defmodule Hop do
   @config_keys [
     :max_depth,
     :max_content_length,
+    :max_page_visits,
     :accepted_mime_types,
     :accepted_schemes,
     :crawl_query?,
@@ -168,6 +170,13 @@ defmodule Hop do
   @doc type: :builder
   def new(url, opts \\ []) when is_binary(url) or is_list(url) do
     opts = Keyword.validate!(opts, [:prefetch, :fetch, :next, :config])
+
+    url =
+      if is_list(url) do
+        Enum.map(url, &normalize_url/1) |> Enum.reject(&is_nil/1) |> Enum.uniq()
+      else
+        normalize_url(url)
+      end
 
     opts
     |> Enum.into(default_hop(url))
@@ -277,6 +286,7 @@ defmodule Hop do
   def default_config(key)
   def default_config(:max_depth), do: @default_max_depth
   def default_config(:max_content_length), do: @default_max_content_length
+  def default_config(:max_page_visits), do: @default_max_page_visits
   def default_config(:accepted_schemes), do: @default_accepted_schemes
   def default_config(:accepted_mime_types), do: @default_accepted_mime_types
   def default_config(:crawl_query?), do: true
@@ -308,19 +318,40 @@ defmodule Hop do
           MapSet.member?(state.visited, url)
         end)
 
-      case leftover do
-        [] ->
-          nil
+      has_exceeded_visit_limit? =
+        MapSet.size(state.visited) > config(hop, :max_page_visits)
 
-        [{_, depth}] when depth > max_depth ->
-          nil
+      # TODO: Refactor this
+      # Super ugly, but covers my needs for now
+      if has_exceeded_visit_limit? do
+        nil
+      else
+        case leftover do
+          [] ->
+            nil
 
-        [{url, depth} | rest] ->
-          {response, next_links, state} = do_visit(hop, url, state)
-          new_links = rest ++ Enum.map(next_links, &{&1, depth + 1})
-          state = visit(state, url)
+          [{_, depth}] when depth > max_depth ->
+            nil
 
-          {{url, response, state}, {new_links, state}}
+          [{url, depth} | rest] ->
+            {response, next_links, state} = do_visit(hop, url, state)
+            new_links = rest ++ Enum.map(next_links, &{&1, depth + 1})
+
+            # TODO: Refactor
+            # Only mark the URL as visited if we actually got a response
+            # I do think this could cause a problem for a url that fails to respond
+            # so its just a hack for now.
+            # The alternative is to track the actual 'visited' page count differently in the
+            # state and revert the visited logic to include all the URLs that hit the prefetch flow.
+            state =
+              if is_nil(response) do
+                state
+              else
+                visit(state, url)
+              end
+
+            {{url, response, state}, {new_links, state}}
+        end
       end
     end)
     |> Stream.reject(fn {_url, response, _} -> is_nil(response) end)
@@ -330,6 +361,11 @@ defmodule Hop do
     with {:ok, url} <- hop.prefetch.(url, state, config),
          {:ok, response, state} <- hop.fetch.(url, state, config),
          {:ok, links, state} <- hop.next.(url, response, state, config) do
+      links =
+        Enum.map(links, &normalize_url/1)
+        |> Enum.reject(&is_nil/1)
+        |> Enum.uniq()
+
       {response, links, state}
     else
       _error ->
@@ -448,7 +484,7 @@ defmodule Hop do
       as unique links to crawl. Defaults to `true`
 
       * `:crawl_fragment?` - whether or not to treat fragments as
-      unique links to crawl. Defaults to `false`  
+      unique links to crawl. Defaults to `false`
   """
   @doc type: :html
   def fetch_links(url, body, opts \\ []) do
@@ -513,4 +549,25 @@ defmodule Hop do
       end
     end
   end
+
+  defp normalize_url(url) when is_binary(url) do
+    url = String.downcase(url)
+
+    case URI.parse(url) do
+      %URI{scheme: nil} ->
+        normalize_url("https://#{url}")
+
+      %URI{path: "/"} ->
+        String.trim_trailing(url, "/")
+        |> normalize_url()
+
+      %URI{host: host} = normalized when is_binary(host) and host != "" ->
+        URI.to_string(normalized)
+
+      _ ->
+        nil
+    end
+  end
+
+  defp normalize_url(_url), do: nil
 end
